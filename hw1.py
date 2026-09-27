@@ -62,8 +62,89 @@ def build_chain() -> Any:
     Use the vision-capable DeepSeek Flash model named
     ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
     """
-    ### YOUR CODE HERE
-    return None
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
+
+    # The prompt asks only for values printed on the paper, never for a total the
+    # model worked out, so the arithmetic happens in Python where it can be
+    # checked. Braces are doubled because this template uses f-string syntax.
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """You are a meticulous receipt auditor. You are shown exactly one \
+supermarket receipt photo, which may be rotated; turn it in your head and read it if needed.
+
+Transcribe the paper evidence into this JSON object and reply with the JSON object ONLY - \
+no markdown code fence, no commentary, no text before or after it:
+
+{{
+  "subtotal_after_discounts_before_rounding": <number>,
+  "discount_lines": [{{"label": "<printed text of the line>", "amount": <positive number>}}],
+  "discount_total": <number>,
+  "amount_paid_after_rounding": <number>,
+  "amount_without_discounts": <number>
+}}
+
+Field rules:
+- "subtotal_after_discounts_before_rounding": copy the printed subtotal line (Chinese 小計, \
+or SUBTOTAL / 總額). This is the amount AFTER the discounts and BEFORE the ROUNDING line.
+- "discount_lines": EVERY printed line that reduces the bill, each with its discount amount \
+written as a POSITIVE number, in the order printed. This covers packaging-damage lines \
+(包裝變形), coupons (COUPON / 優惠券), member prices (MB PRICE / MB $Xoff / 會員), app offers \
+(APP upgrade / App Upgrad$), bundle promotions (Buy 2 Save $, Buy 3 Save $), and percentage \
+discounts (5% OFF, 10% OFF). A discount printed as a negative number such as -12.40 or \
+-$9.99 is reported as positive.
+- "discount_total": add up your own "discount_lines" amounts and put that total here.
+- "amount_paid_after_rounding": the final amount actually charged, i.e. the printed OCTOPUS \
+/ VISA / payment line or the 餘額 line, read after the ROUNDING line has been applied.
+- "amount_without_discounts": the bill as it would have been with no discounts at all, which \
+is "subtotal_after_discounts_before_rounding" plus "discount_total". The ROUNDING line is \
+part of the discount calculation only in the sense that it is already inside the subtotal; \
+do not add rounding on top of this figure.
+
+Important exclusions - these are NOT discounts:
+- the ROUNDING line itself,
+- any plastic-bag surcharge (PLASTIC BAG CHARGIN, e.g. $1.00),
+- money paid, change (找續/CHANGE), points balances, or card numbers.
+
+The most important rule - do not copy numbers out of label text:
+- A promotion LABEL embeds a number that is NOT the discount amount. Labels such as \
+"Buy 2 Save $5", "Buy 3 Save $9.8" or "App Upgrad$30->$20" only describe the offer.
+- The discount is the amount printed in the MONEY COLUMN on the far right of that line.
+- Read the money column first, then the label. Never copy the label number into the amount.
+- Example of the trap: the line "Buy 2 Save $5" can carry a money column amount of -$6.00. \
+The correct answer for that line is 6.00, not 5.00.
+- A COUPON line may print $0.00 in the money column. That is not an error: report 0.00 when \
+that is what the money column really shows, and never invent an amount for it.
+
+Rules:
+1. Copy every digit character by character from the image. Never estimate and never round.
+2. Only "discount_total" and "amount_without_discounts" may be worked out by adding up the \
+values above; every other field is copied from the paper exactly as printed.
+3. If a value is genuinely absent from the receipt, use 0 for numbers and [] for lists.
+4. Reply with the JSON object and nothing else.""",
+            ),
+            (
+                "human",
+                [
+                    {
+                        "type": "text",
+                        "text": "Audit receipt {receipt_label} and return its JSON record.",
+                    },
+                    {"type": "image_url", "image_url": {"url": "{image_url}"}},
+                ],
+            ),
+        ]
+    )
+
+    llm = ChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        temperature=0,
+        max_retries=3,
+        timeout=120,
+    )
+    return prompt | llm
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -77,10 +158,81 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     Use the provided ``image_data_url(path)`` helper to put local images in
     multimodal human messages. LangChain's ``batch`` method is one simple way
     to process independent receipt-extraction prompts in parallel.
+
+    The chain returns the four figures of one receipt in the same shape as
+    ``ground_truth.json``, so this function only has to add them across receipts:
+    ``amount_paid_after_rounding`` answers the first query and
+    ``amount_without_discounts`` answers the second.
     """
-    ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    amounts: dict[str, Decimal] = {QUERY_1: Decimal("0.00"), QUERY_2: Decimal("0.00")}
+    unreadable: list[str] = []
+    required = (
+        "subtotal_after_discounts_before_rounding",
+        "discount_total",
+        "amount_paid_after_rounding",
+        "amount_without_discounts",
+    )
+
+    payloads = [
+        {
+            "image_url": image_data_url(path),
+            "receipt_label": f"{index} of {len(images)} ({path.name})",
+        }
+        for index, path in enumerate(images, start=1)
+    ]
+    for path, reply in zip(images, chain.batch(payloads)):
+        text = response_text(reply)
+        start = text.find("{")
+        record = None
+        if start != -1:
+            try:
+                parsed, _ = json.JSONDecoder().raw_decode(text[start:])
+                record = parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                record = None
+        if record is None:
+            unreadable.append(f"{path.name} (reply was not JSON)")
+            continue
+
+        # A figure only counts if it really is a number; anything else would
+        # silently poison the sum.
+        missing = [key for key in required if record.get(key) is None]
+        if missing:
+            unreadable.append(f"{path.name} (missing {', '.join(missing)})")
+            continue
+        values = [Decimal(str(record[key])).quantize(Decimal("0.01")) for key in required]
+        subtotal, discount_total, paid, without = values
+
+        # These two lines describe every receipt in this format, so a record
+        # that breaks them was misread and is not safe to add up.
+        issues = []
+        if subtotal <= 0:
+            issues.append("subtotal is not positive")
+        if paid <= 0:
+            issues.append("amount_paid_after_rounding is not positive")
+        elif (subtotal - paid).copy_abs() > Decimal("1.00"):
+            issues.append("subtotal and payment differ by more than rounding")
+        if discount_total < 0:
+            issues.append("discount_total is negative")
+        if without < subtotal and without < paid:
+            issues.append("amount_without_discounts is below both other figures")
+
+        if issues:
+            unreadable.append(f"{path.name} ({'; '.join(issues)})")
+            continue
+
+        amounts[QUERY_1] += paid
+        amounts[QUERY_2] += without
+
+    if unreadable:
+        # A partial sum would be scored as one wrong amount anyway, so report the
+        # failure instead of a number that is quietly missing receipts.
+        note = "unreadable receipt(s): " + ", ".join(unreadable)
+        return {QUERY_1: note, QUERY_2: note}
+
+    # The response must parse to exactly one amount, so it is the bare figure:
+    # extra prose, or even a trailing period, would hide it from the scorer.
+    return {QUERY_1: f"HK${amounts[QUERY_1]:.2f}", QUERY_2: f"HK${amounts[QUERY_2]:.2f}"}
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

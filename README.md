@@ -49,5 +49,24 @@ homework runner.
 
 
 ## Homework 1 solution: 
-> to students: please fill your solution description here.
+
+![Chain design](chain_design.png)
+
+The design splits the work across the two functions. `build_chain()` sets up the model and
+prompt once, and the prompt asks the vision model to do nothing but read one receipt: it
+returns that receipt's figures in the same shape as `ground_truth.json`
+(`subtotal_after_discounts_before_rounding`, `discount_lines`, `discount_total`,
+`amount_paid_after_rounding`, `amount_without_discounts`), with every discount written as a
+positive number so `discount_total` is a plain sum, and with the non-discounts named
+explicitly (the rounding line, the plastic-bag surcharge, change, and points balances). The
+prompt also warns the model never to copy a number out of a promotion label, but to read the true discount price column. `answer_queries()` then batches the chain over the whole
+folder, rejects any record that is not JSON or that cannot describe a real receipt (missing
+fields, a non-positive subtotal or payment, a subtotal-to-payment gap too large to be
+rounding) by returning `unreadable receipt(s): ...` rather than a total that is quietly
+missing a receipt, and finally sums `amount_paid_after_rounding` for question 1 and
+`amount_without_discounts` for question 2 in `Decimal`. Each response is the bare amount
+(`HK$1974.30`), because the runner extracts the single number from the text.
+
+**Result.** `python hw1.py --image-folder public_test` gives `HK$1974.30` and `HK$2348.20`,
+both `correct` in `results.csv`.
 
